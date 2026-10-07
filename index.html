@@ -72,12 +72,27 @@
   .recipe ul, .recipe ol { margin: 0; padding-left: 20px; }
   .recipe li.need { color: var(--danger); font-weight: 600; }
   .recipe li .tag { font-size: .8rem; font-weight: 400; margin-left: 4px; }
-  .recipe .actions { margin-top: 12px; }
+  .recipe .actions { margin-top: 12px; display: flex; gap: 8px; }
+  #profileBar { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; color: var(--muted); }
+  #profileBar strong { color: var(--text); }
+  #profileBar button { padding: 4px 10px; }
+  dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--text); padding: 20px; width: min(360px, calc(100vw - 32px)); }
+  dialog::backdrop { background: rgba(0,0,0,.4); }
+  dialog p { margin: 0 0 4px; }
+  dialog .row { margin-top: 12px; }
+  #dialogError { color: var(--danger); min-height: 1.5em; margin-top: 8px; }
+  details.recipe > summary { cursor: pointer; font-weight: 600; }
+  details.recipe > summary small { font-weight: 400; color: var(--muted); margin-left: 6px; }
+  button.danger { color: var(--danger); border-color: var(--danger); }
 </style>
 </head>
 <body>
 <main>
   <h1>🧊 냉장고 레시피</h1>
+  <div id="profileBar">
+    <span id="profileLabel"></span>
+    <button id="profileBtn" class="secondary" type="button">프로필 입력</button>
+  </div>
 
   <section id="step1">
     <h2>① 사진 · 재료</h2>
@@ -104,11 +119,33 @@
     <div id="status2" aria-live="polite"></div>
     <div id="recipes"></div>
   </section>
+
+  <section id="step3">
+    <h2>③ 내 레시피</h2>
+    <div id="status3" aria-live="polite"></div>
+    <div id="saved"></div>
+  </section>
 </main>
+
+<dialog id="profileDialog" aria-labelledby="dialogTitle">
+  <form id="profileForm" method="dialog">
+    <p id="dialogTitle"><strong>이름을 입력해 주세요</strong></p>
+    <p style="color: var(--muted); font-size: .9rem;">같은 이름으로 다시 들어오면 저장한 레시피를 볼 수 있어요. 비밀번호가 없으니 민감한 정보는 쓰지 마세요.</p>
+    <div class="row">
+      <input id="nameInput" maxlength="20" placeholder="이름 (1~20자)" aria-label="이름" autocomplete="off">
+    </div>
+    <div id="dialogError" aria-live="polite"></div>
+    <div class="row">
+      <button type="submit" id="nameSubmit">확인</button>
+      <button type="button" id="nameCancel" class="secondary">취소</button>
+    </div>
+  </form>
+</dialog>
 
 <script>
 // 공개 가능한 값만 둡니다 (service_role 키 금지).
 const SUPABASE_URL = "https://bkebbwsfwcnrrhbkrtyt.supabase.co";
+const SUPABASE_KEY = "sb_publishable_7gPnaBYMNoPONKPkaYI6tw_9CwgTQDd"; // 공개용(publishable) 키
 const MAX_INGREDIENTS = 40;
 const MAX_SIDE = 1024;
 
@@ -257,41 +294,242 @@ function el(tag, text, cls) {
   return n;
 }
 
+// 카드 본문(요약·재료·순서)을 container에 채웁니다. 모든 문자열은 textContent로만 넣습니다.
+function fillRecipeBody(container, r) {
+  container.appendChild(el("p", r.summary || ""));
+
+  const meta = el("div", null, "meta");
+  meta.appendChild(el("span", r.cook_time_min ? `⏱ ${r.cook_time_min}분` : ""));
+  if (r.difficulty) meta.appendChild(el("span", r.difficulty, "badge"));
+  container.appendChild(meta);
+
+  container.appendChild(el("h4", "재료"));
+  const ul = el("ul");
+  (r.ingredients || []).forEach((i) => {
+    const li = el("li", i.amount ? `${i.name} ${i.amount}` : i.name, i.have ? "" : "need");
+    if (!i.have) li.appendChild(el("span", "추가 필요", "tag"));
+    ul.appendChild(li);
+  });
+  container.appendChild(ul);
+
+  container.appendChild(el("h4", "조리 순서"));
+  const ol = el("ol");
+  (r.steps || []).forEach((s) => ol.appendChild(el("li", s)));
+  container.appendChild(ol);
+}
+
 function renderRecipes(list) {
   els.recipes.textContent = "";
   list.forEach((r) => {
     const card = el("article", null, "recipe");
     card.appendChild(el("h3", r.title));
-    card.appendChild(el("p", r.summary));
-
-    const meta = el("div", null, "meta");
-    meta.appendChild(el("span", `⏱ ${r.cook_time_min}분`));
-    meta.appendChild(el("span", r.difficulty, "badge"));
-    card.appendChild(meta);
-
-    card.appendChild(el("h4", "재료"));
-    const ul = el("ul");
-    r.ingredients.forEach((i) => {
-      const li = el("li", i.amount ? `${i.name} ${i.amount}` : i.name, i.have ? "" : "need");
-      if (!i.have) li.appendChild(el("span", "추가 필요", "tag"));
-      ul.appendChild(li);
-    });
-    card.appendChild(ul);
-
-    card.appendChild(el("h4", "조리 순서"));
-    const ol = el("ol");
-    r.steps.forEach((s) => ol.appendChild(el("li", s)));
-    card.appendChild(ol);
+    fillRecipeBody(card, r);
 
     const actions = el("div", null, "actions");
     const save = el("button", "저장", "secondary");
-    save.disabled = true;      // 3단계에서 연결
+    save.addEventListener("click", () => saveRecipe(r, save));
     actions.appendChild(save);
     card.appendChild(actions);
 
     els.recipes.appendChild(card);
   });
 }
+
+// ---------- 3단계: 프로필 · 저장 · 조회 ----------
+const REST = `${SUPABASE_URL}/rest/v1`;
+const dbHeaders = { apikey: SUPABASE_KEY, "Content-Type": "application/json" };
+
+async function db(path, { method = "GET", body, returning = false } = {}) {
+  const headers = { ...dbHeaders };
+  if (returning) headers.Prefer = "return=representation";
+  const res = await fetch(`${REST}/${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    const err = new Error((data && data.message) || "데이터베이스 요청에 실패했습니다.");
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
+let profile = null;   // { id, name }
+
+function loadStoredProfile() {
+  try {
+    const id = localStorage.getItem("profile_id");
+    const name = localStorage.getItem("profile_name");
+    if (id && name) profile = { id, name };
+  } catch { /* 저장소를 못 쓰는 환경이면 무시 */ }
+}
+function storeProfile() {
+  try {
+    if (profile) { localStorage.setItem("profile_id", profile.id); localStorage.setItem("profile_name", profile.name); }
+    else { localStorage.removeItem("profile_id"); localStorage.removeItem("profile_name"); }
+  } catch { /* 무시 */ }
+}
+
+function normalizeName(raw) { return raw.trim().replace(/\s+/g, " "); }
+
+async function findOrCreateProfile(name) {
+  const find = async () => {
+    const rows = await db(`profiles?name=eq.${encodeURIComponent(name)}&select=id,name`);
+    return rows[0] || null;
+  };
+  let p = await find();
+  if (p) return p;
+  try {
+    const rows = await db("profiles", { method: "POST", body: { name }, returning: true });
+    return { id: rows[0].id, name: rows[0].name };
+  } catch (e) {
+    if (e.status === 409) { p = await find(); if (p) return p; }   // 동시에 만들어진 경우
+    throw e;
+  }
+}
+
+function renderProfileBar() {
+  $("profileLabel").textContent = "";
+  if (profile) {
+    $("profileLabel").appendChild(document.createTextNode("프로필: "));
+    $("profileLabel").appendChild(el("strong", profile.name));
+    $("profileBtn").textContent = "변경";
+  } else {
+    $("profileLabel").textContent = "프로필 없음";
+    $("profileBtn").textContent = "프로필 입력";
+  }
+}
+
+// 이름 입력 창을 열고, 프로필이 정해지면 그 값을, 취소하면 null을 돌려줍니다.
+function askProfile() {
+  return new Promise((resolve) => {
+    const dlg = $("profileDialog");
+    const input = $("nameInput");
+    const errBox = $("dialogError");
+    const form = $("profileForm");
+    let done = false;
+    errBox.textContent = "";
+    input.value = "";
+
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      form.removeEventListener("submit", onSubmit);
+      $("nameCancel").removeEventListener("click", onCancel);
+      dlg.removeEventListener("close", onCancel);
+      if (dlg.open) dlg.close();
+      resolve(value);
+    };
+    const onCancel = () => finish(null);
+    const onSubmit = async (e) => {
+      e.preventDefault();
+      const name = normalizeName(input.value);
+      const len = [...name].length;
+      if (len < 1 || len > 20) { errBox.textContent = "이름은 1~20자로 입력해 주세요."; return; }
+      $("nameSubmit").disabled = true;
+      errBox.textContent = "";
+      try {
+        const p = await findOrCreateProfile(name);
+        profile = p;
+        storeProfile();
+        renderProfileBar();
+        finish(p);
+      } catch (err) {
+        errBox.textContent = err instanceof TypeError ? "네트워크 연결을 확인해 주세요." : "프로필을 만들지 못했습니다. 다시 시도해 주세요.";
+      } finally {
+        $("nameSubmit").disabled = false;
+      }
+    };
+    form.addEventListener("submit", onSubmit);
+    $("nameCancel").addEventListener("click", onCancel);
+    dlg.addEventListener("close", onCancel);
+    dlg.showModal();
+    input.focus();
+  });
+}
+
+function setStatus3(msg, error = false) {
+  $("status3").className = error ? "error" : "";
+  $("status3").style.marginTop = msg ? "4px" : "0";
+  $("status3").textContent = msg;
+}
+
+async function loadSaved() {
+  const box = $("saved");
+  box.textContent = "";
+  if (!profile) { setStatus3("프로필을 입력하면 저장한 레시피를 볼 수 있어요."); return; }
+  setStatus3("불러오는 중입니다...");
+  const owner = profile.id;
+  try {
+    const rows = await db(`recipes?profile_id=eq.${owner}&select=*&order=created_at.desc`);
+    if (!profile || profile.id !== owner) return;   // 불러오는 사이 프로필이 바뀐 경우
+    setStatus3(rows.length ? "" : "저장한 레시피가 없습니다.");
+    rows.forEach((r) => box.appendChild(buildSavedItem(r)));
+  } catch (e) {
+    setStatus3(e instanceof TypeError ? "네트워크 연결을 확인해 주세요." : "레시피를 불러오지 못했습니다.", true);
+  }
+}
+
+function buildSavedItem(r) {
+  const item = el("details", null, "recipe");
+  const sum = el("summary", r.title);
+  sum.appendChild(el("small", new Date(r.created_at).toLocaleDateString("ko-KR")));
+  item.appendChild(sum);
+  fillRecipeBody(item, r);
+
+  const actions = el("div", null, "actions");
+  const del = el("button", "삭제", "secondary danger");
+  del.addEventListener("click", async () => {
+    if (!confirm(`'${r.title}' 레시피를 삭제할까요?`)) return;
+    del.disabled = true;
+    try {
+      await db(`recipes?id=eq.${r.id}`, { method: "DELETE" });
+      item.remove();
+      if (!$("saved").children.length) setStatus3("저장한 레시피가 없습니다.");
+    } catch {
+      del.disabled = false;
+      setStatus3("삭제하지 못했습니다. 다시 시도해 주세요.", true);
+    }
+  });
+  actions.appendChild(del);
+  item.appendChild(actions);
+  return item;
+}
+
+async function saveRecipe(r, btn) {
+  if (btn.dataset.saved) return;
+  btn.disabled = true;
+  try {
+    if (!profile && !(await askProfile())) { btn.disabled = false; return; }
+    await db("recipes", {
+      method: "POST",
+      body: {
+        profile_id: profile.id, title: r.title, summary: r.summary,
+        cook_time_min: r.cook_time_min, difficulty: r.difficulty,
+        ingredients: r.ingredients, steps: r.steps,
+      },
+    });
+    btn.dataset.saved = "1";
+    btn.textContent = "저장됨";
+    loadSaved();
+  } catch (e) {
+    btn.disabled = false;
+    setStatus2(e instanceof TypeError ? "네트워크 연결을 확인해 주세요." : "저장하지 못했습니다. 다시 시도해 주세요.", { error: true });
+  }
+}
+
+$("profileBtn").addEventListener("click", async () => {
+  if (profile) {
+    profile = null;
+    storeProfile();
+    renderProfileBar();
+    await loadSaved();
+    document.querySelectorAll("#recipes .actions button").forEach((b) => { delete b.dataset.saved; b.textContent = "저장"; b.disabled = false; });
+  }
+  if (await askProfile()) { await loadSaved(); }
+});
+
+loadStoredProfile();
+renderProfileBar();
+loadSaved();
 
 async function recommend() {
   if (busy2 || !ingredients.length) return;
